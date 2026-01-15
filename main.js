@@ -1,7 +1,7 @@
 // ==================== 配置常量（统一管理，便于后续扩展） ====================
 const CONFIG = {
-    SPAWN_NAME: "Allsafe1",
-    ROOM_NAME: "E33N36",
+    SPAWN_NAME: "Your Spawn Name",
+    ROOM_NAME: "Your Room Name",
     // Creep身体配置（优化部件比例，提升工作/移动效率）
     CREEP_BODIES: {
         HARVESTER: [WORK, WORK, CARRY, CARRY, MOVE, MOVE], // 2WORK+2CARRY+1MOVE：采集快、移动稳，适配双资源点
@@ -855,4 +855,5 @@ module.exports.loop = function () {
                 break;
         }
     }
+
 };
