@@ -1,288 +1,237 @@
 /*******************************
- * Screeps 6类任务修复版（建造/维修/防御正常执行）
- * 特性：采集/升级/储能/建造/维修/防御 全部闭环工作 + 适配前期 + 容错性强
+ * Screeps 精准配置版（采集Creep随机分配2个Source+指定任务数量）
+ * 特性：采集8个|升级6个|建造维修2个|运输1个|随机分配Source|container满自动切换储能设施
  *******************************/
 
-// ====================== 模块 1：6类核心任务配置（微调门槛，适配触发） ======================
+// ====================== 模块 1：全局配置（保留核心，优化储能设施筛选） ======================
+const GlobalConfig = {
+  reusePath: 100,
+  rangeOptimize: 1,
+  // 储能设施优先级排序（从高到低）
+  energyStorageStructures: [
+    STRUCTURE_SPAWN,
+    STRUCTURE_EXTENSION,
+    STRUCTURE_TOWER,
+    STRUCTURE_STORAGE
+  ]
+};
+
+// ====================== 模块 2：核心任务配置（精准指定各类任务数量） ======================
 const TaskConfig = {
   tasks: {
-    upgrade: { // 1. 升级：最高优先级，房间发展核心
-      priority: 10,
-      maxWorkers: 8,
-      desc: "从Container取能，升级控制器"
+    harvest: { // 采集：8个
+      priority: 10, // 最高优先级，保证能量输入
+      maxWorkers: 9,
+      desc: "随机分配Source采集，container满则送往各类储能设施"
     },
-    defense: { // 2. 防御：次高优先级，场景专属（敌对入侵触发）
+    upgrade: { // 升级控制器：6个
       priority: 9,
-      maxWorkers: 2,
-      desc: "清除入侵敌对Creep"
+      maxWorkers: 6,
+      desc: "从储能设施取能，升级房间控制器"
     },
-    harvest: { // 3. 采集：基础优先级，能量来源保障
+    build: { // 建造：1个（与维修合计2个）
       priority: 8,
-      maxWorkers: 4,
-      desc: "从Source采集能量，存入Container"
-    },
-    store: { // 4. 储能：辅助优先级，积累能量资源
-      priority: 7,
-      maxWorkers: 4,
-      desc: "前期填充Spawn/Extension，后期填充Storage"
-    },
-    build: { // 5. 建造：中等优先级，降低触发门槛
-      priority: 6,
       maxWorkers: 2,
-      desc: "优先建造Container/Extension，再普通建造"
+      desc: "能量盈余时，建造建筑设施"
     },
-    repair: { // 6. 维修：最低优先级，大幅降低触发门槛
-      priority: 5,
+    repair: { // 维修：1个（与建造合计2个）
+      priority: 7,
+      maxWorkers: 2,
+      desc: "能量盈余时，维修受损建筑"
+    },
+    transport: { // 运输：1个
+      priority: 6,
       maxWorkers: 1,
-      desc: "优先维修核心设施，再维修墙/壁垒"
+      desc: "转运能量，补充各类储能设施库存"
     }
   },
 
-  // 按房间模式调整任务配置（仅修改优先级，保持核心逻辑）
+  // 无需按房间模式调整数量，严格遵循用户指定配置
   adjustTaskConfigByMode(roomMode) {
     const config = JSON.parse(JSON.stringify(this.tasks));
-
-    switch (roomMode) {
-      case "bootstrap": // 前期（RCL<3）：优先升级，放宽建造/维修门槛
-        config.upgrade.priority = 10;
-        config.upgrade.maxWorkers = 8;
-        config.build.priority = 7; // 建造优先级小幅提升，加快基建
-        break;
-      case "defense": // 防御模式：优先防御，其次维修
-        config.defense.priority = 10;
-        config.repair.priority = 9;
-        break;
-      case "economy": // 经济模式：优先储能，积累资源
-        config.store.priority = 8;
-        config.store.maxWorkers = 4;
-        break;
+    // 仅在防御模式下提升防御优先级（保留兼容，不修改数量）
+    if (roomMode === "defense") {
+      const defenseTask = {
+        defense: { priority: 11, maxWorkers: 2, desc: "抵御敌对Creep入侵" }
+      };
+      return Object.assign(defenseTask, config);
     }
-
     return config;
   },
 
-  // 获取任务最大执行者数量
   getTaskMaxWorkers(taskType, roomMode) {
     const adjustedConfig = this.adjustTaskConfigByMode(roomMode);
     return (adjustedConfig[taskType] && adjustedConfig[taskType].maxWorkers) || 0;
+  },
+
+  // 能量盈余判断（用于建造/维修任务触发）
+  hasEnergySurplus(room) {
+    const storage = room.storage;
+    const containerEnergy = room.find(FIND_STRUCTURES, {
+      filter: s => s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] > 0
+    }).reduce((total, container) => total + container.store[RESOURCE_ENERGY], 0);
+    // 有storage则判断storage能量≥5000，无storage则判断container能量≥2000
+    return storage ? storage.store[RESOURCE_ENERGY] >= 5000 : containerEnergy >= 2000;
+  },
+
+  // 筛选可用的储能设施（spawn/extension/tower/storage）
+  getAvailableEnergyStructures(room) {
+    const targets = [];
+    GlobalConfig.energyStorageStructures.forEach(structType => {
+      const structs = room.find(FIND_MY_STRUCTURES, {
+        filter: s => s.structureType === structType && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+      });
+      if (structs.length > 0) targets.push(...structs);
+    });
+    return targets;
+  },
+
+  // 判断container是否已满
+  isContainerFull(container) {
+    return container.store.getFreeCapacity(RESOURCE_ENERGY) === 0;
   }
 };
 
-// ====================== 模块 2：任务管理器（核心修复：任务可执行性判断 + 逻辑闭环） ======================
+// ====================== 模块 3：任务管理器（核心修改：采集Creep随机分配Source） ======================
 const TaskManager = {
-  // 统计各任务当前执行者数量
   countTaskWorkers(room) {
     const creepList = room.find(FIND_MY_CREEPS);
     const taskCount = {};
 
+    // 初始化所有任务数量为0
     Object.keys(TaskConfig.tasks).forEach(taskType => {
       taskCount[taskType] = 0;
     });
 
+    // 统计当前各任务的Creep数量
     creepList.forEach(creep => {
-      if (creep.memory.currentTask && creep.memory.taskStatus === "executing") {
-        const taskType = creep.memory.currentTask;
-        if (taskCount.hasOwnProperty(taskType)) {
-          taskCount[taskType]++;
-        }
+      if (creep.memory.currentTask && taskCount.hasOwnProperty(creep.memory.currentTask)) {
+        taskCount[creep.memory.currentTask]++;
       }
     });
 
     return taskCount;
   },
 
-  // 为Creep分配最优任务（按优先级排序）
   assignOptimalTask(creep) {
-    // 任务执行中，直接返回当前任务，不重新分配
-    if (creep.memory.currentTask && creep.memory.taskStatus === "executing") {
+    // 任务一旦分配，不中途更换（确保数量稳定，避免频繁切换）
+    if (creep.memory.currentTask) {
       return creep.memory.currentTask;
     }
 
     const room = creep.room;
     const roomMode = Strategy.getRoomMode(room);
-    const adjustedTaskConfig = TaskConfig.adjustTaskConfigByMode(roomMode);
+    const adjustedConfig = TaskConfig.adjustTaskConfigByMode(roomMode);
     const currentTaskCount = this.countTaskWorkers(room);
+    const hasEnergySurplus = TaskConfig.hasEnergySurplus(room);
 
-    // 按优先级降序排序任务（高优先级在前）
-    const sortedTasks = Object.entries(adjustedTaskConfig)
+    // 按优先级排序，精准分配任务（严格控制不超过maxWorkers）
+    const sortedTasks = Object.entries(adjustedConfig)
       .sort((a, b) => b[1].priority - a[1].priority)
       .map(([taskType, config]) => ({ taskType, config }));
 
-    // 筛选可用任务：未达数量上限 + 任务可执行（修复核心：放宽建造/维修条件）
     for (const { taskType, config } of sortedTasks) {
-      if (currentTaskCount[taskType] < config.maxWorkers) {
-        const taskCanExecute = this._checkTaskExecutable(creep, taskType, roomMode);
-        if (taskCanExecute) {
-          creep.memory.currentTask = taskType;
-          creep.memory.taskStatus = "executing";
-          return taskType;
-        }
+      // 跳过已达数量上限的任务
+      if (currentTaskCount[taskType] >= config.maxWorkers) continue;
+
+      // 建造/维修任务需满足能量盈余条件
+      if ((taskType === "build" || taskType === "repair") && !hasEnergySurplus) continue;
+
+      // 验证任务是否可执行
+      if (this._checkTaskExecutable(creep, taskType, room)) {
+        creep.memory.currentTask = taskType;
+        console.log(`[${creep.name}] 分配任务：${taskType}（当前数量：${currentTaskCount[taskType]+1}/${config.maxWorkers}）`);
+        return taskType;
       }
     }
 
-    // 无可用任务，清空状态
-    creep.memory.currentTask = null;
-    creep.memory.taskStatus = "finished";
-    return null;
+    // 兜底：分配采集任务（确保无Creep闲置）
+    creep.memory.currentTask = "harvest";
+    return "harvest";
   },
 
-  // 修复核心：调整6类任务的可执行性判断（移除建造/维修的初始能量要求）
-  _checkTaskExecutable(creep, taskType, roomMode) {
-    const room = creep.room;
-    const adjustedConfig = TaskConfig.adjustTaskConfigByMode(roomMode);
-
+  _checkTaskExecutable(creep, taskType, room) {
     switch (taskType) {
       case "harvest":
-        // 可执行条件：有可用Source + 采集者未达上限 + Creep有空闲容量
-        const availableSources = room.find(FIND_SOURCES, { filter: s => s.energy > 0 });
-        const maxHarvesters = adjustedConfig.harvest.maxWorkers;
-        const currentHarvesters = this.countTaskWorkers(room).harvest || 0;
-        return !!availableSources.length && currentHarvesters < maxHarvesters && creep.store.getFreeCapacity() > 0;
-
+        return !!room.find(FIND_SOURCES, { filter: s => s.energy > 0 }).length;
       case "upgrade":
-        // 可执行条件：有控制器 + 有可用能量（Container/Source）
-        const hasAvailableEnergy = !!room.find(FIND_STRUCTURES, {
-          filter: s => s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] > 0
-        }).length || !!room.find(FIND_SOURCES, { filter: s => s.energy > 0 }).length;
-        return !!(room.controller && room.controller.my) && hasAvailableEnergy;
-
-      case "store":
-        // 可执行条件：有需要填充的储能设施（前期Spawn/Extension，后期Storage）
-        const energyStructures = room.find(FIND_MY_STRUCTURES, {
-          filter: s => {
-            const validEarlyTypes = [STRUCTURE_SPAWN, STRUCTURE_EXTENSION, STRUCTURE_CONTAINER];
-            const validLateTypes = [STRUCTURE_STORAGE];
-            const hasFreeCapacity = s.store ? s.store.getFreeCapacity(RESOURCE_ENERGY) > 0 : false;
-            return (validEarlyTypes.includes(s.structureType) || (validLateTypes.includes(s.structureType) && room.storage)) && hasFreeCapacity;
-          }
-        });
-        // 修复：移除Creep初始能量要求，后续在执行逻辑中取能
-        return !!energyStructures.length;
-
+        return !!(room.controller && room.controller.my) && !!this._getAvailableEnergyContainer(creep).length;
       case "build":
-        // 修复核心1：移除`creep.store[RESOURCE_ENERGY] > 0`，仅要求有建造工地
-        // 修复核心2：增加工地容错，即使无核心设施工地，普通工地也可触发
-        const constructionSites = room.find(FIND_CONSTRUCTION_SITES);
-        return !!constructionSites.length;
-
+        return !!room.find(FIND_CONSTRUCTION_SITES).length;
       case "repair":
-        // 修复核心1：移除`creep.store[RESOURCE_ENERGY] > 0`，后续取能
-        // 修复核心2：降低房间能量门槛（从1000→500），适配前期
-        // 修复核心3：放宽受损设施筛选（从0.7→0.9），更容易触发
-        const damagedStructures = room.find(FIND_STRUCTURES, { filter: s => s.hits < s.hitsMax * 0.9 });
-        const roomEnergyEnough = room.energyAvailable >= 500;
-        return !!damagedStructures.length && roomEnergyEnough;
-
+        return !!room.find(FIND_STRUCTURES, { filter: s => s.hits < s.hitsMax * 0.95 }).length;
+      case "transport":
+        return !!TaskConfig.getAvailableEnergyStructures(room).length && !!this._getAvailableEnergyContainer(creep).length;
       case "defense":
-        // 可执行条件：有敌对Creep入侵（场景专属，日常无触发）
-        const hostileCreeps = room.find(FIND_HOSTILE_CREEPS);
-        return !!hostileCreeps.length;
-
+        return !!room.find(FIND_HOSTILE_CREEPS).length;
       default:
         return true;
     }
   },
 
-  // 随机分配可用Source（保留核心，解决扎堆问题）
-  _getRandomAvailableSource(room, creep) {
+  // ====================== 核心修改：随机分配可用Source ======================
+  _getAvailableSource(creep) {
+    const room = creep.room;
+    // 1. 获取所有能量>0的可用Source
     const availableSources = room.find(FIND_SOURCES, { filter: s => s.energy > 0 });
     if (availableSources.length === 0) return null;
-
-    // 统计各Source采集者数量，避免极端随机扎堆
-    const sourceLoadMap = {};
-    availableSources.forEach(source => {
-      sourceLoadMap[source.id] = { source, workerCount: 0 };
-    });
-
-    room.find(FIND_MY_CREEPS).forEach(c => {
-      const boundSourceId = c.memory.boundSource;
-      if (boundSourceId && c.memory.currentTask === "harvest" && c.store.getFreeCapacity() > 0) {
-        if (sourceLoadMap[boundSourceId]) sourceLoadMap[boundSourceId].workerCount++;
-      }
-    });
-
-    // 筛选最少采集者的Source集合，随机选择
-    let minWorkerCount = Infinity;
-    const lowestLoadSources = [];
-    Object.values(sourceLoadMap).forEach(item => {
-      if (item.workerCount < minWorkerCount) {
-        minWorkerCount = item.workerCount;
-        lowestLoadSources.length = 0;
-        lowestLoadSources.push(item.source);
-      } else if (item.workerCount === minWorkerCount) {
-        lowestLoadSources.push(item.source);
-      }
-    });
-
-    const randomIndex = Math.floor(Math.random() * lowestLoadSources.length);
-    return lowestLoadSources[randomIndex];
+    // 2. 随机选择一个Source（核心：从可用数组中随机取，实现2个Source的均匀分配）
+    const randomIndex = Math.floor(Math.random() * availableSources.length);
+    return availableSources[randomIndex];
   },
 
-  // 查找可用能量Container（供upgrade/store/build/repair任务使用，增加容错）
+  // 获取有能量的container（数组形式，方便运输任务筛选）
   _getAvailableEnergyContainer(creep) {
     const room = creep.room;
-    let boundContainer = null;
-
-    // 验证已绑定Container的有效性
-    if (creep.memory.boundContainer) {
-      boundContainer = Game.getObjectById(creep.memory.boundContainer);
-      if (boundContainer && boundContainer.store[RESOURCE_ENERGY] > 0) {
-        return boundContainer;
-      } else {
-        creep.memory.boundContainer = null;
-      }
-    }
-
-    // 修复：放宽Container查找条件，无Source旁Container时，允许查找任何有能量的Container
-    const allAvailableContainers = room.find(FIND_STRUCTURES, {
+    return room.find(FIND_STRUCTURES, {
       filter: s => s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] > 0
     });
-
-    if (allAvailableContainers.length === 0) return null;
-
-    // 优先返回最近的Container，减少移动耗时
-    return creep.pos.findClosestByPath(allAvailableContainers);
   },
 
-  // 更新任务执行状态
-  markTaskStatus(creep, status) {
-    creep.memory.taskStatus = status;
+  // 获取最近的有能量container
+  getClosestEnergyContainer(creep) {
+    const containers = this._getAvailableEnergyContainer(creep);
+    if (containers.length === 0) return null;
+    return creep.pos.findClosestByPath(containers);
   }
 };
 
-// ====================== 模块 3：房间策略层（适配修复，保持原有模式） ======================
+// ====================== 模块 4：房间策略层（保留核心模式） ======================
 const Strategy = {
   getRoomMode(room) {
     const hostileCreeps = room.find(FIND_HOSTILE_CREEPS);
-    if (hostileCreeps.length > 0) return "defense"; // 防御模式：有敌对入侵
+    if (hostileCreeps.length > 0) return "defense";
 
-    if (room.controller && room.controller.level < 3) return "bootstrap"; // 前期模式：快速升级
+    if (room.controller && room.controller.level < 3) return "bootstrap";
 
-    if (room.storage && room.storage.store.energy > 10000) return "economy"; // 经济模式：积累资源
+    if (room.storage && room.storage.store.energy > 20000) return "economy";
 
-    return "normal"; // 普通模式：均衡发展
+    return "normal";
   }
 };
 
-// ====================== 模块 4：孵化管理器（修复：防御Creep配置 + 适配建造/维修） ======================
+// ====================== 模块 5：孵化管理器（适配不同任务Creep身体配置） ======================
 const SpawnManager = {
-  globalMaxCreeps: 50, // 前期可调整为20，RCL≥5后启用50
+  globalMaxCreeps: 25, // 8+6+1+1+1=17，匹配用户指定总数量
+  minCreepThreshold: 20,
 
-  // 按房间等级返回Creep配置（修复：防御Creep增加攻击能力，普通Creep保留取能/执行能力）
-  getCreepBodyByRoomLevel(room) {
-    const rcl = room.controller ? room.controller.level : 1;
-    const isDefenseMode = Strategy.getRoomMode(room) === "defense";
-
-    // 修复：防御Creep增加攻击能力，同时保留移动能力，降低孵化成本（适配前期）
-    if (isDefenseMode) {
-      return { body: [ATTACK, MOVE, MOVE], cost: 150 }; // 更低成本，更容易孵化
-    }
-
-    // 普通模式：前期250成本，后期300成本（保留取能/执行能力，适配建造/维修/储能）
-    if (rcl >= 3) {
-      return { body: [WORK, WORK, CARRY, CARRY, MOVE, MOVE], cost: 300 };
-    } else {
-      return { body: [WORK, CARRY, MOVE, MOVE], cost: 250 };
+  // 不同任务Creep的身体配置（按需优化能力）
+  getCreepBodyByTask(taskType) {
+    switch (taskType) {
+      case "harvest": // 采集Creep：侧重采集和移动，兼顾携带
+        return { body: [WORK, CARRY, MOVE, MOVE], cost: 200 };
+      case "upgrade": // 升级Creep：侧重携带和移动，保证持续升级
+        return { body: [CARRY, CARRY, MOVE, WORK], cost: 200 };
+      case "build": // 建造Creep：兼顾携带和建造
+        return { body: [WORK, CARRY, MOVE, CARRY], cost: 200 };
+      case "repair": // 维修Creep：同建造Creep配置
+        return { body: [WORK, CARRY, MOVE, CARRY], cost: 200 };
+      case "transport": // 运输Creep：侧重携带能力
+        return { body: [CARRY, CARRY, CARRY, MOVE, MOVE], cost: 250 };
+      case "defense": // 防御Creep：基础攻击配置
+        return { body: [ATTACK, MOVE, ATTACK], cost: 150 };
+      default: // 默认：采集配置
+        return { body: [WORK, CARRY, MOVE], cost: 150 };
     }
   },
 
@@ -293,52 +242,47 @@ const SpawnManager = {
     const roomMode = Strategy.getRoomMode(room);
     const allCreeps = room.find(FIND_MY_CREEPS);
     const totalCreeps = allCreeps.length;
-    const taskCount = TaskManager.countTaskWorkers(room);
-    const adjustedTaskConfig = TaskConfig.adjustTaskConfigByMode(roomMode);
-    const creepConfig = this.getCreepBodyByRoomLevel(room);
+    const currentTaskCount = TaskManager.countTaskWorkers(room);
+    const adjustedConfig = TaskConfig.adjustTaskConfigByMode(roomMode);
 
-    // 检查总Creep数量上限
-    if (totalCreeps >= this.globalMaxCreeps) {
-      console.log(`[${room.name}] 总Creeps已达上限（${totalCreeps}/${this.globalMaxCreeps}）`);
-      return;
-    }
+    // 未达总数量阈值，优先孵化缺口最大的任务Creep
+    if (totalCreeps < this.minCreepThreshold) {
+      // 找出缺口最大的任务
+      let maxShortageTask = "harvest";
+      let maxShortage = 0;
+      Object.entries(adjustedConfig).forEach(([taskType, config]) => {
+        const shortage = config.maxWorkers - (currentTaskCount[taskType] || 0);
+        if (shortage > maxShortage) {
+          maxShortage = shortage;
+          maxShortageTask = taskType;
+        }
+      });
 
-    // 检查是否有任务缺人（重点：建造/维修任务是否缺人）
-    const hasTaskShortage = Object.entries(adjustedTaskConfig).some(
-      ([taskType, config]) => taskCount[taskType] < config.maxWorkers
-    );
-
-    if (!hasTaskShortage) {
-      console.log(`[${room.name}] 所有任务执行者充足`);
-      return;
-    }
-
-    // 检查能量是否充足
-    if (room.energyAvailable < creepConfig.cost) {
-      console.log(`[${room.name}] 能量不足：孵化需要 ${creepConfig.cost}，当前 ${room.energyAvailable}`);
-      return;
-    }
-
-    // 孵化Creep，初始化内存（保留Container绑定，适配建造/维修）
-    const creepName = `Worker-${Game.time}`;
-    const spawnResult = mainSpawn.spawnCreep(creepConfig.body, creepName, {
-      memory: {
-        working: false,
-        currentTask: null,
-        taskStatus: "finished",
-        boundSource: null,
-        boundContainer: null
+      // 孵化对应任务的Creep
+      const creepConfig = this.getCreepBodyByTask(maxShortageTask);
+      if (room.energyAvailable < creepConfig.cost) {
+        console.log(`[${room.name}] 孵化能量不足（需要 ${creepConfig.cost}，当前 ${room.energyAvailable}）`);
+        return;
       }
-    });
 
-    if (spawnResult === OK) {
-      console.log(`[${room.name}] 成功孵化Creep：${creepName}（配置：${creepConfig.body.join(',')}）`);
-    } else {
-      console.log(`[${room.name}] 孵化失败：${this._getSpawnErrorMsg(spawnResult)}`);
+      const creepName = `${maxShortageTask}-${Game.time}`;
+      const spawnResult = mainSpawn.spawnCreep(creepConfig.body, creepName, {
+        memory: {
+          currentTask: null,
+          boundSource: null,
+          taskType: maxShortageTask // 标记任务类型，方便后续分配
+        }
+      });
+
+      if (spawnResult === OK) {
+        console.log(`[${room.name}] 孵化成功：${creepName}（${maxShortageTask}任务，当前总数量：${totalCreeps+1}/${this.minCreepThreshold}）`);
+      }
+      return;
     }
+
+    console.log(`[${room.name}] Creep数量已达上限（${totalCreeps}/${this.minCreepThreshold}）`);
   },
 
-  // 错误码映射
   _getSpawnErrorMsg(errorCode) {
     const errorMap = {
       [ERR_NOT_ENOUGH_ENERGY]: "能量不足",
@@ -350,23 +294,20 @@ const SpawnManager = {
   }
 };
 
-// ====================== 模块 5：Creep管理器（核心修复：建造/维修/防御执行逻辑闭环） ======================
+// ====================== 模块 6：Creep管理器（保留采集交付逻辑） ======================
 const CreepManager = {
-  // 主逻辑：分发6类任务执行
   runCreepLogic(creep) {
+    // 分配任务（确保每个Creep都有对应任务）
     const currentTask = creep.memory.currentTask || TaskManager.assignOptimalTask(creep);
     if (!currentTask) return;
 
-    // 分发对应任务的执行方法（修复：建造/维修增加容错，防御增加状态重置）
+    // 执行对应任务
     switch (currentTask) {
+      case "harvest":
+        this._handleHarvestTask(creep); // 核心：优化container满时的交付逻辑
+        break;
       case "upgrade":
         this._handleUpgradeTask(creep);
-        break;
-      case "harvest":
-        this._handleHarvestTask(creep);
-        break;
-      case "store":
-        this._handleStoreTask(creep);
         break;
       case "build":
         this._handleBuildTask(creep);
@@ -374,371 +315,248 @@ const CreepManager = {
       case "repair":
         this._handleRepairTask(creep);
         break;
+      case "transport":
+        this._handleTransportTask(creep);
+        break;
       case "defense":
         this._handleDefenseTask(creep);
         break;
       default:
-        TaskManager.markTaskStatus(creep, "failed");
+        creep.memory.currentTask = "harvest";
+        this._handleHarvestTask(creep);
         break;
     }
   },
 
-  // 1. 升级任务：从Container取能 → 升级控制器（保留正常逻辑）
+  // 采集任务：container满则送往spawn/extension/tower/storage
+  _handleHarvestTask(creep) {
+    const room = creep.room;
+    let source = null;
+
+    // 绑定/验证Source（使用随机分配的Source）
+    if (creep.memory.boundSource) {
+      source = Game.getObjectById(creep.memory.boundSource);
+    }
+    if (!source || source.energy <= 0) {
+      source = TaskManager._getAvailableSource(creep);
+      if (!source) {
+        console.log(`[${creep.name}] 无可用Source，暂停工作`);
+        return;
+      }
+      creep.memory.boundSource = source.id;
+    }
+
+    // 空能量→采集
+    if (creep.store.getFreeCapacity() > 0) {
+      const harvestResult = creep.harvest(source);
+      if (harvestResult === ERR_NOT_IN_RANGE) {
+        creep.moveTo(source, {
+          reusePath: GlobalConfig.reusePath,
+          range: GlobalConfig.rangeOptimize,
+          visualizePathStyle: { stroke: "#ffaa00" }
+        });
+      }
+    }
+    // 满能量→交付（优先判断container是否可用）
+    else {
+      // 1. 查找最近的非满container
+      const containers = room.find(FIND_STRUCTURES, {
+        filter: s => s.structureType === STRUCTURE_CONTAINER && !TaskConfig.isContainerFull(s)
+      });
+      const targetContainer = creep.pos.findClosestByPath(containers);
+
+      // 2. container可用（未满）→ 送往container
+      if (targetContainer) {
+        const transferResult = creep.transfer(targetContainer, RESOURCE_ENERGY);
+        if (transferResult === ERR_NOT_IN_RANGE) {
+          creep.moveTo(targetContainer, {
+            reusePath: GlobalConfig.reusePath,
+            range: GlobalConfig.rangeOptimize,
+            visualizePathStyle: { stroke: "#ffcc00" }
+          });
+        }
+      }
+      // 3. container已满/无可用container→ 送往spawn/extension/tower/storage
+      else {
+        const energyStructures = TaskConfig.getAvailableEnergyStructures(room);
+        if (energyStructures.length === 0) {
+          console.log(`[${creep.name}] 无可用储能设施，暂无法交付`);
+          return;
+        }
+
+        const targetStructure = creep.pos.findClosestByPath(energyStructures);
+        const transferResult = creep.transfer(targetStructure, RESOURCE_ENERGY);
+        if (transferResult === ERR_NOT_IN_RANGE) {
+          creep.moveTo(targetStructure, {
+            reusePath: GlobalConfig.reusePath,
+            range: GlobalConfig.rangeOptimize,
+            visualizePathStyle: { stroke: "#00ff00" }
+          });
+        }
+      }
+    }
+  },
+
+  // 升级控制器任务
   _handleUpgradeTask(creep) {
     const room = creep.room;
     const ctrl = room.controller;
-    if (!ctrl || !ctrl.my) {
-      TaskManager.markTaskStatus(creep, "failed");
-      return;
-    }
+    if (!ctrl || !ctrl.my) return;
 
-    // 能量不足：从Container取能
+    // 空能量→从container取能
     if (creep.store[RESOURCE_ENERGY] === 0) {
-      const availableContainer = TaskManager._getAvailableEnergyContainer(creep);
-      if (!availableContainer) {
-        // 无Container，降级为采集任务
+      const container = TaskManager.getClosestEnergyContainer(creep);
+      if (!container) {
         this._handleHarvestTask(creep);
         return;
       }
-
-      creep.memory.boundContainer = availableContainer.id;
-      const withdrawResult = creep.withdraw(availableContainer, RESOURCE_ENERGY);
+      const withdrawResult = creep.withdraw(container, RESOURCE_ENERGY);
       if (withdrawResult === ERR_NOT_IN_RANGE) {
-        creep.moveTo(availableContainer, {
-          reusePath: 50,
-          visualizePathStyle: { stroke: "#ffa500" },
-          range: 1
+        creep.moveTo(container, {
+          reusePath: GlobalConfig.reusePath,
+          range: GlobalConfig.rangeOptimize
         });
-      } else if (withdrawResult !== OK) {
-        creep.memory.boundContainer = null;
       }
     }
-    // 能量充足：升级控制器
+    // 有能量→升级控制器
     else {
-      creep.memory.boundContainer = null;
       const upgradeResult = creep.upgradeController(ctrl);
       if (upgradeResult === ERR_NOT_IN_RANGE) {
         creep.moveTo(ctrl, {
-          reusePath: 50,
-          range: 3,
-          visualizePathStyle: { stroke: "#00aaff" }
+          reusePath: GlobalConfig.reusePath,
+          range: 3
         });
       }
     }
   },
 
-  // 2. 采集任务：随机Source采集 → 存入就近Container（保留正常逻辑）
-  _handleHarvestTask(creep) {
-    const room = creep.room;
-    let boundSource = null;
-
-    // 读取并验证已绑定的Source
-    if (creep.memory.boundSource) {
-      boundSource = Game.getObjectById(creep.memory.boundSource);
-      if (!boundSource || boundSource.energy <= 0) {
-        creep.memory.boundSource = null;
-        boundSource = null;
-      }
-    }
-
-    // 重新绑定随机可用Source
-    if (!boundSource) {
-      boundSource = TaskManager._getRandomAvailableSource(room, creep);
-      if (!boundSource) return;
-      creep.memory.boundSource = boundSource.id;
-    }
-
-    // 执行采集
-    const harvestResult = creep.harvest(boundSource);
-    if (harvestResult === ERR_NOT_IN_RANGE) {
-      creep.moveTo(boundSource, {
-        reusePath: 50,
-        visualizePathStyle: { stroke: "#ffaa00" },
-        range: 1
-      });
-    }
-    // 采集满能量：存入就近Container
-    else if (creep.store.getFreeCapacity() === 0) {
-      const nearbyContainer = creep.pos.findClosestByPath(FIND_STRUCTURES, {
-        filter: s => s.structureType === STRUCTURE_CONTAINER && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-      });
-
-      if (nearbyContainer) {
-        const transferResult = creep.transfer(nearbyContainer, RESOURCE_ENERGY);
-        if (transferResult === ERR_NOT_IN_RANGE) {
-          creep.moveTo(nearbyContainer, { reusePath: 50, visualizePathStyle: { stroke: "#ffcc00" } });
-        }
-        // 存入成功后，清空Source绑定，准备下一轮采集
-        else if (transferResult === OK) {
-          creep.memory.boundSource = null;
-        }
-      }
-    }
-  },
-
-  // 3. 储能任务：前期填充Spawn/Extension → 后期填充Storage（保留正常逻辑）
-  _handleStoreTask(creep) {
-    const room = creep.room;
-
-    // 能量不足：从Container取能
-    if (creep.store[RESOURCE_ENERGY] === 0) {
-      const availableContainer = TaskManager._getAvailableEnergyContainer(creep);
-      if (!availableContainer) return;
-
-      const withdrawResult = creep.withdraw(availableContainer, RESOURCE_ENERGY);
-      if (withdrawResult === ERR_NOT_IN_RANGE) {
-        creep.moveTo(availableContainer, {
-          reusePath: 50,
-          visualizePathStyle: { stroke: "#ffd700" },
-          range: 1
-        });
-      }
-    }
-    // 能量充足：填充储能设施
-    else {
-      // 优先填充前期设施（Spawn/Extension）
-      const earlyEnergyStructures = room.find(FIND_MY_STRUCTURES, {
-        filter: s => [STRUCTURE_SPAWN, STRUCTURE_EXTENSION].includes(s.structureType) && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-      });
-
-      // 后期填充Storage
-      const lateEnergyStructures = room.find(FIND_MY_STRUCTURES, {
-        filter: s => s.structureType === STRUCTURE_STORAGE && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
-      });
-
-      const target = earlyEnergyStructures.length > 0 
-        ? creep.pos.findClosestByPath(earlyEnergyStructures)
-        : (lateEnergyStructures.length > 0 ? creep.pos.findClosestByPath(lateEnergyStructures) : null);
-
-      if (!target) return;
-
-      const transferResult = creep.transfer(target, RESOURCE_ENERGY);
-      if (transferResult === ERR_NOT_IN_RANGE) {
-        creep.moveTo(target, {
-          reusePath: 50,
-          visualizePathStyle: { stroke: "#00ff00" }
-        });
-      }
-      // 填充成功后，清空Container绑定
-      else if (transferResult === OK) {
-        creep.memory.boundContainer = null;
-      }
-    }
-  },
-
-  // 4. 建造任务：修复核心 → 先分配任务，再取能，最后建造（闭环逻辑）
+  // 建造任务
   _handleBuildTask(creep) {
     const room = creep.room;
+    const sites = room.find(FIND_CONSTRUCTION_SITES);
+    if (!sites.length) return;
 
-    // 步骤1：先检查是否有建造工地（无工地则重置任务）
-    const allSites = room.find(FIND_CONSTRUCTION_SITES);
-    if (!allSites.length) {
-      TaskManager.markTaskStatus(creep, "finished");
-      creep.memory.currentTask = null;
-      return;
-    }
-
-    // 步骤2：能量不足 → 从Container取能（修复：无初始能量也能执行）
+    // 空能量→从container取能
     if (creep.store[RESOURCE_ENERGY] === 0) {
-      const availableContainer = TaskManager._getAvailableEnergyContainer(creep);
-      if (!availableContainer) {
-        console.log(`[${room.name}] 建造任务：无可用Container取能，等待采集`);
-        return;
-      }
-
-      // 绑定Container，执行取能
-      creep.memory.boundContainer = availableContainer.id;
-      const withdrawResult = creep.withdraw(availableContainer, RESOURCE_ENERGY);
+      const container = TaskManager.getClosestEnergyContainer(creep);
+      if (!container) return;
+      const withdrawResult = creep.withdraw(container, RESOURCE_ENERGY);
       if (withdrawResult === ERR_NOT_IN_RANGE) {
-        creep.moveTo(availableContainer, {
-          reusePath: 50,
-          visualizePathStyle: { stroke: "#ffff00" },
-          range: 1
+        creep.moveTo(container, {
+          reusePath: GlobalConfig.reusePath,
+          range: GlobalConfig.rangeOptimize
         });
-      } else if (withdrawResult === OK) {
-        console.log(`[${room.name}] 建造任务：取能成功，准备建造`);
-      } else {
-        creep.memory.boundContainer = null;
-        console.log(`[${room.name}] 建造任务：取能失败，错误码：${withdrawResult}`);
       }
-      return;
     }
-
-    // 步骤3：能量充足 → 执行建造（优先核心设施，再普通建造）
-    creep.memory.boundContainer = null; // 清空Container绑定
-
-    // 优先建造核心设施（Container/Extension）
-    const coreSites = room.find(FIND_CONSTRUCTION_SITES, {
-      filter: s => [STRUCTURE_CONTAINER, STRUCTURE_EXTENSION].includes(s.structureType)
-    });
-
-    const targetSite = coreSites.length > 0 
-      ? creep.pos.findClosestByPath(coreSites)
-      : creep.pos.findClosestByPath(allSites);
-
-    if (!targetSite) return;
-
-    // 执行建造
-    const buildResult = creep.build(targetSite);
-    if (buildResult === ERR_NOT_IN_RANGE) {
-      creep.moveTo(targetSite, {
-        reusePath: 50,
-        range: 3,
-        visualizePathStyle: { stroke: "#ffff00" }
-      });
-    } else if (buildResult === OK) {
-      // 建造消耗能量后，若能量耗尽，重置Container绑定，准备下一轮取能
-      if (creep.store[RESOURCE_ENERGY] === 0) {
-        creep.memory.boundContainer = null;
+    // 有能量→建造
+    else {
+      const target = creep.pos.findClosestByPath(sites);
+      const buildResult = creep.build(target);
+      if (buildResult === ERR_NOT_IN_RANGE) {
+        creep.moveTo(target, {
+          reusePath: GlobalConfig.reusePath,
+          range: 3
+        });
       }
     }
   },
 
-  // 5. 维修任务：修复核心 → 降低门槛，先取能，再维修（闭环逻辑）
+  // 维修任务
   _handleRepairTask(creep) {
     const room = creep.room;
+    const damaged = room.find(FIND_STRUCTURES, { filter: s => s.hits < s.hitsMax * 0.95 });
+    if (!damaged.length) return;
 
-    // 步骤1：先检查是否有受损设施（无受损则重置任务）
-    const allDamaged = room.find(FIND_STRUCTURES, { filter: s => s.hits < s.hitsMax * 0.9 });
-    if (!allDamaged.length) {
-      TaskManager.markTaskStatus(creep, "finished");
-      creep.memory.currentTask = null;
-      return;
-    }
-
-    // 步骤2：能量不足 → 从Container取能（修复：无初始能量也能执行）
+    // 空能量→从container取能
     if (creep.store[RESOURCE_ENERGY] === 0) {
-      const availableContainer = TaskManager._getAvailableEnergyContainer(creep);
-      if (!availableContainer) {
-        console.log(`[${room.name}] 维修任务：无可用Container取能，等待采集`);
-        return;
-      }
-
-      // 绑定Container，执行取能
-      creep.memory.boundContainer = availableContainer.id;
-      const withdrawResult = creep.withdraw(availableContainer, RESOURCE_ENERGY);
+      const container = TaskManager.getClosestEnergyContainer(creep);
+      if (!container) return;
+      const withdrawResult = creep.withdraw(container, RESOURCE_ENERGY);
       if (withdrawResult === ERR_NOT_IN_RANGE) {
-        creep.moveTo(availableContainer, {
-          reusePath: 50,
-          visualizePathStyle: { stroke: "#ff00ff" },
-          range: 1
+        creep.moveTo(container, {
+          reusePath: GlobalConfig.reusePath,
+          range: GlobalConfig.rangeOptimize
         });
-      } else if (withdrawResult === OK) {
-        console.log(`[${room.name}] 维修任务：取能成功，准备维修`);
-      } else {
-        creep.memory.boundContainer = null;
-        console.log(`[${room.name}] 维修任务：取能失败，错误码：${withdrawResult}`);
       }
-      return;
     }
-
-    // 步骤3：能量充足 → 执行维修（优先核心设施，再墙/壁垒）
-    creep.memory.boundContainer = null; // 清空Container绑定
-
-    // 优先维修核心设施（非墙/壁垒，放宽到0.9满血）
-    const coreDamaged = room.find(FIND_STRUCTURES, {
-      filter: s => s.hits < s.hitsMax * 0.9 && ![STRUCTURE_WALL, STRUCTURE_RAMPART].includes(s.structureType)
-    });
-
-    // 后期维修墙/壁垒（放宽到0.8满血，适配前期）
-    const wallDamaged = room.find(FIND_STRUCTURES, {
-      filter: s => [STRUCTURE_WALL, STRUCTURE_RAMPART].includes(s.structureType) && s.hits < s.hitsMax * 0.8
-    });
-
-    const targetDamaged = coreDamaged.length > 0 
-      ? creep.pos.findClosestByPath(coreDamaged)
-      : (wallDamaged.length > 0 ? creep.pos.findClosestByPath(wallDamaged) : null);
-
-    if (!targetDamaged) return;
-
-    // 执行维修
-    const repairResult = creep.repair(targetDamaged);
-    if (repairResult === ERR_NOT_IN_RANGE) {
-      creep.moveTo(targetDamaged, {
-        reusePath: 50,
-        visualizePathStyle: { stroke: "#ff00ff" }
-      });
-    } else if (repairResult === OK) {
-      // 维修消耗能量后，若能量耗尽，重置Container绑定，准备下一轮取能
-      if (creep.store[RESOURCE_ENERGY] === 0) {
-        creep.memory.boundContainer = null;
+    // 有能量→维修
+    else {
+      const target = creep.pos.findClosestByPath(damaged);
+      const repairResult = creep.repair(target);
+      if (repairResult === ERR_NOT_IN_RANGE) {
+        creep.moveTo(target, {
+          reusePath: GlobalConfig.reusePath
+        });
       }
     }
   },
 
-  // 6. 防御任务：修复核心 → 场景触发后闭环执行，无敌对则重置任务
+  // 运输任务（从container转运能量到各类储能设施）
+  _handleTransportTask(creep) {
+    const room = creep.room;
+
+    // 空能量→从container取能
+    if (creep.store.getFreeCapacity() > 0) {
+      const container = TaskManager.getClosestEnergyContainer(creep);
+      if (!container) return;
+      const withdrawResult = creep.withdraw(container, RESOURCE_ENERGY);
+      if (withdrawResult === ERR_NOT_IN_RANGE) {
+        creep.moveTo(container, {
+          reusePath: GlobalConfig.reusePath,
+          range: GlobalConfig.rangeOptimize
+        });
+      }
+    }
+    // 有能量→送往储能设施
+    else {
+      const energyStructures = TaskConfig.getAvailableEnergyStructures(room);
+      if (energyStructures.length === 0) return;
+
+      const targetStructure = creep.pos.findClosestByPath(energyStructures);
+      const transferResult = creep.transfer(targetStructure, RESOURCE_ENERGY);
+      if (transferResult === ERR_NOT_IN_RANGE) {
+        creep.moveTo(targetStructure, {
+          reusePath: GlobalConfig.reusePath,
+          range: GlobalConfig.rangeOptimize
+        });
+      }
+    }
+  },
+
+  // 防御任务
   _handleDefenseTask(creep) {
     const room = creep.room;
-    const hostileCreeps = room.find(FIND_HOSTILE_CREEPS);
+    const hostiles = room.find(FIND_HOSTILE_CREEPS);
+    if (!hostiles.length) return;
 
-    // 步骤1：无敌对Creep，重置任务（修复：避免占用任务名额）
-    if (!hostileCreeps.length) {
-      TaskManager.markTaskStatus(creep, "finished");
-      creep.memory.currentTask = null;
-      console.log(`[${room.name}] 防御任务：无敌对Creep，任务结束`);
-      return;
-    }
-
-    // 步骤2：查找最近的敌对Creep，执行攻击
-    const targetHostile = creep.pos.findClosestByPath(hostileCreeps);
-    if (!targetHostile) return;
-
-    // 执行攻击（修复：增加错误处理，无攻击部件则输出日志）
-    const attackResult = creep.attack(targetHostile);
+    const target = creep.pos.findClosestByPath(hostiles);
+    const attackResult = creep.attack(target);
     if (attackResult === ERR_NOT_IN_RANGE) {
-      creep.moveTo(targetHostile, {
-        reusePath: 50,
-        visualizePathStyle: { stroke: "#ff0000" }
+      creep.moveTo(target, {
+        reusePath: GlobalConfig.reusePath
       });
-    } else if (attackResult === ERR_NO_BODYPART) {
-      console.log(`[${room.name}] 防御任务：Creep无攻击部件，无法攻击`);
-    } else if (attackResult === OK) {
-      console.log(`[${room.name}] 防御任务：攻击敌对Creep成功`);
     }
   }
 };
 
-// ====================== 模块 6：数据记录器（适配6类任务统计，增加建造/维修日志） ======================
-const DataRecorder = {
-  recordStats(room) {
-    if (!Memory.stats) Memory.stats = {};
-    const taskCount = TaskManager.countTaskWorkers(room);
-    const ctrlLevel = room.controller && room.controller.level || 0;
-    const constructionSitesCount = room.find(FIND_CONSTRUCTION_SITES).length;
-    const damagedStructuresCount = room.find(FIND_STRUCTURES, { filter: s => s.hits < s.hitsMax * 0.9 }).length;
-
-    Memory.stats[room.name] = {
-      time: Game.time,
-      mode: Strategy.getRoomMode(room),
-      totalCreeps: room.find(FIND_MY_CREEPS).length,
-      energy: room.energyAvailable,
-      ctrlLevel: ctrlLevel,
-      constructionSitesCount: constructionSitesCount,
-      damagedStructuresCount: damagedStructuresCount,
-      taskWorkers: taskCount // 统计6类任务的执行者数量
-    };
-
-    // 每1000tick输出一次统计日志，方便查看建造/维修任务状态
-    if (Game.time % 1000 === 0) {
-      console.log(`[${room.name}] 统计数据：`, JSON.stringify(Memory.stats[room.name]));
-    }
-  }
-};
-
-// ====================== 主循环（简洁高效，清理内存+执行任务） ======================
+// ====================== 模块 7：主循环（确保逻辑执行流畅） ======================
 module.exports.loop = function () {
-  // 清理死亡Creep的内存
+  // 清理死亡Creep内存
   for (const name in Memory.creeps) {
-    if (!Game.creeps[name]) delete Memory.creeps[name];
+    if (!Game.creeps[name]) {
+      delete Memory.creeps[name];
+      console.log(`[清理内存] 移除死亡Creep：${name}`);
+    }
   }
 
-  // 遍历所有已占领房间，执行核心逻辑
+  // 遍历房间执行逻辑
   const myRooms = Object.values(Game.rooms).filter(r => r.controller && r.controller.my);
   for (const room of myRooms) {
-    DataRecorder.recordStats(room);
     SpawnManager.spawnOptimizedCreeps(room);
 
-    for (const creep of room.find(FIND_MY_CREEPS)) {
+    // 执行所有Creep逻辑
+    const creeps = room.find(FIND_MY_CREEPS);
+    for (const creep of creeps) {
       CreepManager.runCreepLogic(creep);
     }
   }
