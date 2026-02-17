@@ -7,7 +7,7 @@
 
 // ===================== 全局配置 (整合优化) =====================
 const GLOBAL_CONFIG = {
-    HOME_ROOM: 'W13S59',
+    HOME_ROOM: 'XXXXXXXXXXXXXXXXXXX',
     // Lab 配方配置 (示例: 合成氧化氢)
     LAB_RECIPES: [
         {id: 'GHOUL', result: RESOURCE_GHODIUM, in: [RESOURCE_ZYNTHIUM, RESOURCE_ZYNTHIUM]}
