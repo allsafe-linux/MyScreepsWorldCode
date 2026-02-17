@@ -190,7 +190,7 @@ var ToolUtil = {
 // ===================== 造兵管理器 =====================
 var SpawnManager = {
     BODIES: {
-        harvester: [WORK,WORK,WORK,WORK,WORK,WORK,CARRY,CARRY,MOVE,MOVE,MOVE,MOVE],
+        harvester: [WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,WORK,CARRY,CARRY,CARRY,CARRY,MOVE,MOVE,MOVE,MOVE,MOVE,MOVE],
         transporter: [CARRY,CARRY,CARRY,CARRY,MOVE,MOVE,MOVE,MOVE],
         upgrader: [WORK,WORK,WORK,WORK,WORK,CARRY,CARRY,CARRY,MOVE,MOVE,MOVE], 
         builder: [WORK,WORK,CARRY,CARRY,CARRY,MOVE,MOVE],
@@ -200,7 +200,7 @@ var SpawnManager = {
         attacker: [RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, TOUGH, MOVE, MOVE, MOVE]
     },
     CREEP_NUM: { 
-        harvester: 4, transporter: 1, upgrader: 4, builder: 1, 
+        harvester: 2, transporter: 1, upgrader: 4, builder: 1, 
         defender: 0, miner: 0, scout: 0, attacker: 0
     },
     PRIORITY: ['harvester', 'transporter', 'upgrader', 'miner', 'builder', 'defender'],
@@ -349,10 +349,13 @@ var CreepLogic = {
         if (room.storage && ToolUtil.doAction(creep, room.storage, creep.transfer, '#ffaa00', ['存矿到仓库'], 50)) return;
     },
 
+    // ========== 修复后的 transporter 方法 ==========
     transporter: function(creep) {
         var room = creep.room;
         var RES_TYPE = RESOURCE_ENERGY;
         var TARGET_LOCK_TICK = 10;
+        // 关键：指定spawn旁link的坐标（30,24），优先处理这个link
+        var SPAWN_LINK_POS = new RoomPosition(30, 24, room.name);
 
         var isCachedTargetValid = function(targetId, isWithdraw) {
             if (!targetId) return false;
@@ -360,7 +363,8 @@ var CreepLogic = {
             if (!ToolUtil.isTargetValid(target)) return false;
             
             if (isWithdraw) {
-                return target.store.getUsedCapacity(RES_TYPE) > 50 && 
+                // 降低取能阈值：只要有能量就取，不再限制800
+                return target.store.getUsedCapacity(RES_TYPE) > 0 && 
                        creep.store.getFreeCapacity(RES_TYPE) > 0;
             }
             return target.store.getFreeCapacity(RES_TYPE) > 0 && 
@@ -388,12 +392,22 @@ var CreepLogic = {
             delete creep.memory.targetType;
 
             var target = null;
-            // 1. 矿源附近的link
+            
+            // 优先级1：强制优先处理指定坐标的spawn旁link（30,24）
+            var spawnLink = Game.getObjectById(SPAWN_LINK_POS.lookFor(LOOK_STRUCTURES)[0]?.id);
+            if (spawnLink && spawnLink.structureType === STRUCTURE_LINK && spawnLink.store.getUsedCapacity(RES_TYPE) > 0) {
+                target = spawnLink;
+                lockTarget(target, 'withdraw');
+                ToolUtil.doAction(creep, target, creep.withdraw, '#00ffcc', ['取Spawn链路'], 20, RES_TYPE);
+                return;
+            }
+
+            // 优先级2：矿源附近的link（阈值从800降为100，更灵敏）
             var sourceLinks = room.find(FIND_MY_STRUCTURES, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_LINK && 
                            s.pos.findInRange(FIND_SOURCES, 2).length > 0 &&
-                           s.store.getUsedCapacity(RES_TYPE) > 800;
+                           s.store.getUsedCapacity(RES_TYPE) > 100;
                 }
             });
             if (sourceLinks.length > 0) {
@@ -406,16 +420,17 @@ var CreepLogic = {
                 return;
             }
 
-            // 2. 孵化场附近的link
-            var spawnLinks = room.find(FIND_MY_STRUCTURES, {
+            // 优先级3：其他孵化场附近的link（阈值从800降为100）
+            var otherSpawnLinks = room.find(FIND_MY_STRUCTURES, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_LINK && 
                            s.pos.findInRange(FIND_MY_SPAWNS, 3).length > 0 &&
-                           s.store.getUsedCapacity(RES_TYPE) > 800;
+                           s.store.getUsedCapacity(RES_TYPE) > 100 &&
+                           !(s.pos.x === 30 && s.pos.y === 24); // 排除已优先处理的link
                 }
             });
-            if (spawnLinks.length > 0) {
-                target = spawnLinks[0];
+            if (otherSpawnLinks.length > 0) {
+                target = otherSpawnLinks[0];
             }
             
             if (target) {
@@ -424,12 +439,12 @@ var CreepLogic = {
                 return;
             }
 
-            // 3. 矿源附近的容器
+            // 优先级4：矿源附近的容器（阈值从800降为100）
             var sourceContainers = room.find(FIND_STRUCTURES, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_CONTAINER && 
                            s.pos.findInRange(FIND_SOURCES, 2).length > 0 &&
-                           s.store.getUsedCapacity(RES_TYPE) > 800;
+                           s.store.getUsedCapacity(RES_TYPE) > 100;
                 }
             });
             if (sourceContainers.length > 0) {
@@ -442,7 +457,7 @@ var CreepLogic = {
                 return;
             }
 
-            // 4. 地上掉落的能量
+            // 优先级5：地上掉落的能量
             var droppedResources = creep.pos.findClosestByPath(FIND_DROPPED_RESOURCES, {
                 filter: function(r) {
                     return r.resourceType === RES_TYPE && r.amount > 500;
@@ -455,11 +470,11 @@ var CreepLogic = {
                 return;
             }
 
-            // 5. 其他容器
+            // 优先级6：其他容器
             var containers = room.find(FIND_STRUCTURES, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_CONTAINER && 
-                           s.store.getUsedCapacity(RES_TYPE) > 800;
+                           s.store.getUsedCapacity(RES_TYPE) > 100;
                 }
             });
             if (containers.length > 0) {
@@ -472,7 +487,7 @@ var CreepLogic = {
                 return;
             }
 
-            // 6. 仓库
+            // 优先级7：仓库
             if (room.storage && room.storage.store.getUsedCapacity(RES_TYPE) > 10000) {
                 target = room.storage;
                 lockTarget(target, 'withdraw');
@@ -481,7 +496,7 @@ var CreepLogic = {
             }
 
             ToolUtil.sayWithDuration(creep, ['暂无货源']);
-            creep.moveTo(room.controller.pos, ToolUtil.getMoveOpts(50));
+            creep.moveTo(SPAWN_LINK_POS, ToolUtil.getMoveOpts(50)); // 无货源时蹲守spawn旁link
             return;
         }
 
@@ -499,7 +514,7 @@ var CreepLogic = {
             delete creep.memory.targetType;
 
             var target = null;
-            // 1. 空的孵化场/扩展
+            // 1. 空的孵化场/扩展（优先填满）
             var emptyCore = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
                 filter: function(s) {
                     return (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION) &&
@@ -524,11 +539,11 @@ var CreepLogic = {
                 return;
             }
 
-            // 3. 能量不足50%的塔楼
+            // 3. 能量不足80%的塔楼（阈值从50%提高到80%，更及时补能）
             var lowTower = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_TOWER &&
-                           s.store.getUsedCapacity(RES_TYPE) < s.store.getCapacity(RES_TYPE) * 0.5;
+                           s.store.getUsedCapacity(RES_TYPE) < s.store.getCapacity(RES_TYPE) * 0.8;
                 }
             });
             
@@ -563,7 +578,7 @@ var CreepLogic = {
                 return;
             }
 
-            // 6. 仓库
+            // 6. 仓库（兜底）
             if (room.storage && room.storage.store.getFreeCapacity(RES_TYPE) > 0) {
                 target = room.storage;
                 lockTarget(target, 'transfer');
@@ -572,42 +587,58 @@ var CreepLogic = {
             }
 
             ToolUtil.sayWithDuration(creep, ['暂无需求']);
-            // 移动到第一个孵化场
-            var spawns = room.find(FIND_MY_SPAWNS);
-            if (spawns.length > 0) {
-                creep.moveTo(spawns[0].pos, ToolUtil.getMoveOpts(50));
-            } else {
-                creep.moveTo(room.controller.pos, ToolUtil.getMoveOpts(50));
-            }
+            // 移动到spawn旁link，等待新能量
+            var spawnLinkPos = new RoomPosition(30, 24, room.name);
+            creep.moveTo(spawnLinkPos, ToolUtil.getMoveOpts(50));
             return;
         }
     },
 
+    // ========== 修复后的 upgrader 方法 ==========
     upgrader: function(creep) {
         var room = creep.room;
-        if (!creep.memory.working) {
-            // 控制器附近的link
-            var ctrlLinks = room.find(FIND_MY_STRUCTURES, {
-                filter: function(s) {
-                    return s.structureType === STRUCTURE_LINK && 
-                           s.pos.inRangeTo(room.controller, 3) &&
-                           s.store.getUsedCapacity(RESOURCE_ENERGY) > 0;
-                }
-            });
-            
-            if (ctrlLinks.length > 0 && ToolUtil.doAction(creep, ctrlLinks[0], creep.withdraw, '#66ff66', ['取链路能量'], 50)) return;
+        // 关键：指定controller旁link的坐标（5,6），强制优先取能
+        var CTRL_LINK_POS = new RoomPosition(5, 6, room.name);
 
-            // 有能量的容器
+        if (!creep.memory.working) {
+            // 优先级1：强制优先从指定坐标的controller旁link取能
+            var ctrlLink = Game.getObjectById(CTRL_LINK_POS.lookFor(LOOK_STRUCTURES)[0]?.id);
+            if (ctrlLink && ctrlLink.structureType === STRUCTURE_LINK && ctrlLink.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                if (ToolUtil.doAction(creep, ctrlLink, creep.withdraw, '#66ff66', ['取控制器链路'], 50)) {
+                    return;
+                }
+            }
+
+            // 优先级2：从source旁边的container取能（精准匹配source范围，阈值从500降为100）
             var sourceContainers = room.find(FIND_STRUCTURES, {
                 filter: function(s) {
                     return s.structureType === STRUCTURE_CONTAINER && 
-                           s.store.getUsedCapacity(RESOURCE_ENERGY) > 500;
+                           s.pos.findInRange(FIND_SOURCES, 2).length > 0 && // 确保是source旁的container
+                           s.store.getUsedCapacity(RESOURCE_ENERGY) > 100; // 降低阈值，更容易触发
                 }
             });
-            
-            if (sourceContainers.length > 0 && ToolUtil.doAction(creep, sourceContainers[0], creep.withdraw, '#66ff66', ['取容器能量'], 50)) return;
+            // 选择最近的source旁container
+            if (sourceContainers.length > 0) {
+                var nearestContainer = creep.pos.findClosestByPath(sourceContainers);
+                if (nearestContainer && ToolUtil.doAction(creep, nearestContainer, creep.withdraw, '#66ff66', ['取矿源容器'], 50)) {
+                    return;
+                }
+            }
 
-            // 仓库
+            // 优先级3：其他controller旁的link（兜底）
+            var otherCtrlLinks = room.find(FIND_MY_STRUCTURES, {
+                filter: function(s) {
+                    return s.structureType === STRUCTURE_LINK && 
+                           s.pos.inRangeTo(room.controller, 3) &&
+                           s.store.getUsedCapacity(RESOURCE_ENERGY) > 0 &&
+                           !(s.pos.x === 5 && s.pos.y === 6); // 排除已优先处理的link
+                }
+            });
+            if (otherCtrlLinks.length > 0 && ToolUtil.doAction(creep, otherCtrlLinks[0], creep.withdraw, '#66ff66', ['取链路能量'], 50)) {
+                return;
+            }
+
+            // 优先级4：仓库（最后兜底）
             if (room.storage && room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                 ToolUtil.doAction(creep, room.storage, creep.withdraw, '#66ff66', ['取仓库能量'], 50);
             }
@@ -820,7 +851,7 @@ var LinkManager = {
     }
 };
 
-// ===================== Terminal 管理器 =====================
+// ===================== Terminal 管理器 (修复transfer错误) =====================
 var TerminalManager = {
     ERROR_MSG: {
         ERR_NOT_OWNER: "无订单所有权",
@@ -849,12 +880,15 @@ var TerminalManager = {
         var keepEnergy = GLOBAL_CONFIG.TERMINAL.KEEP_ENERGY;
         var terminalEnergy = terminal.store.getUsedCapacity(RESOURCE_ENERGY);
 
+        // 修复核心错误：Terminal只能用send方法转移资源（即使同房间）
         if (terminalEnergy > keepEnergy && ToolUtil.isTargetValid(room.storage)) {
             var transferAmount = Math.min(terminalEnergy - keepEnergy, 5000);
-            // 修复：使用transfer而不是send（send用于跨房间）
-            var result = terminal.transfer(room.storage, RESOURCE_ENERGY, transferAmount);
+            // 正确用法：terminal.send(资源类型, 数量, 目标房间, 目标结构ID)
+            var result = terminal.send(RESOURCE_ENERGY, transferAmount, room.name, room.storage.id);
             if (result === OK) {
                 console.log('[' + room.name + '] Terminal转移' + transferAmount + '能源至Storage（当前：' + terminalEnergy + '→' + (terminalEnergy-transferAmount) + '）');
+            } else if (result !== ERR_TIRED) { // 冷却中不报错
+                console.log('[' + room.name + '] Terminal转移能量失败：' + (this.ERROR_MSG[result] || '错误码' + result));
             }
         }
     },
